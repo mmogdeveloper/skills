@@ -13,3 +13,9 @@ This is a multi-purpose helper skill for Jesse, designed to automate common work
 - Parameters:
   - content: The text to save.
   - file: (Optional) Target filename, defaults to today's date.
+
+### clean_logs
+- Description: Deletes log files older than a specified number of days to save space.
+- Parameters:
+  - days: (Optional) Retention period in days, defaults to 7.
+  - path: (Optional) Directory to clean, defaults to current logs directory.
