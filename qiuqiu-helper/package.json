@@ -1,0 +1,10 @@
+{
+  "name": "qiuqiu-helper",
+  "version": "0.1.0",
+  "description": "Pragmatic workspace utilities for Jesse.",
+  "author": "球球",
+  "openclaw": {
+    "kind": "skill",
+    "entry": "SKILL.md"
+  }
+}
