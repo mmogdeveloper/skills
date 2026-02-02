@@ -91,6 +91,23 @@ def ahr999_primary_or_fallback():
     return ahr999_selfcalc()
 
 
+def fetch_mvrv_zscore_last(n: int = 1):
+    # Free-ish on-chain endpoint (BGeometrics / bitcoin-data.com)
+    # Example: https://bitcoin-data.com/v1/mvrv-zscore/1
+    url = f"https://bitcoin-data.com/v1/mvrv-zscore/{n}"
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    # when n=1, response is an object; when n>1, could be list (keep simple)
+    if isinstance(j, list):
+        j = j[-1]
+    return {
+        "date": j.get("d"),
+        "value": float(j.get("mvrvZscore")),
+        "source": "bitcoin-data.com (BGeometrics) /v1/mvrv-zscore",
+    }
+
+
 def load_tracker(path: str):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -153,7 +170,13 @@ def get_dca_instruction():
     ahr_val = ahr["value"]
     ahr_source = ahr["source"]
 
-    # 3) Mining cost anchors (MacroMicro Feb 2026 targets; adjustable later)
+    # 3) On-chain confirmation: MVRV Z-Score
+    try:
+        mvrv = fetch_mvrv_zscore_last(1)
+    except Exception as e:
+        mvrv = {"date": None, "value": None, "source": f"unavailable ({e})"}
+
+    # 4) Mining cost anchors (MacroMicro Feb 2026 targets; adjustable later)
     total_cost = 85000
     cash_cost = 60000
 
@@ -174,14 +197,21 @@ def get_dca_instruction():
     else:
         action = "1x"
 
-    # 6) Ammo tracking (record today's recommended action as baseline consumption)
+    # 6) MVRV confirmation rule (to prevent over-aggressive 3x)
+    # Only allow 3x when MVRV Z-Score is "low" (cheap vs realized value).
+    # If MVRV is unavailable, we do NOT block 3x (best-effort), but we mark it.
+    if action == "3x" and mvrv.get("value") is not None:
+        if mvrv["value"] > 1.0:
+            action = "2x"
+
+    # 7) Ammo tracking (record today's recommended action as baseline consumption)
     tracker_path = os.getenv("DCA_TRACKER_PATH", DEFAULT_TRACKER_PATH)
     tracker = update_tracker_for_today(tracker_path, action)
     total_units = int(tracker.get("total_units", DEFAULT_TOTAL_UNITS))
     used_units = int(tracker.get("units_used", 0))
     remaining_units = max(total_units - used_units, 0)
 
-    # 7) Report
+    # 8) Report
     lines = []
     lines.append("=== QIUQIU DCA ADVISOR ===")
     lines.append(f"BTC Spot (Coinbase): ${price:,.2f}")
@@ -190,9 +220,11 @@ def get_dca_instruction():
     if "gma200" in ahr:
         lines.append(f"GMA200 (CG daily):   ${ahr['gma200']:,.2f}")
         lines.append(f"ExpPrice (fixed):    ${ahr['expPrice']:,.2f}  [a={A_EXP}, b={B_EXP}]")
-    lines.append(f"Mining Anchors:      Total ${total_cost:,.0f} / Cash ${cash_cost:,.0f}")
+    lines.append(f"MVRV Z-Score:         {mvrv.get('value')}  ({mvrv.get('date')})")
+    lines.append(f"MVRV Source:          {mvrv.get('source')}")
+    lines.append(f"Mining Anchors:       Total ${total_cost:,.0f} / Cash ${cash_cost:,.0f}")
     lines.append("--------------------------")
-    lines.append(f"RECOMMENDED ACTION: [{action}]")
+    lines.append(f"RECOMMENDED ACTION:  [{action}]")
     lines.append("--------------------------")
     lines.append(f"Ammo (baseline units): used {used_units}/{total_units}, remaining {remaining_units}")
     lines.append(f"Tracker: {tracker_path}")
