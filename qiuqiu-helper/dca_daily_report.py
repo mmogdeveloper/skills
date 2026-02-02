@@ -2,6 +2,7 @@ import requests
 import math
 import datetime as dt
 import os
+import json
 
 # DCA daily report
 # - Price source: Coinbase spot
@@ -16,6 +17,10 @@ GENESIS = dt.date(2009, 1, 3)
 # Empirical adjustment to align self-calc(B) with CoinGlass (based on observed ~8.4% lower)
 # We scale CoinGlass thresholds down by ~0.915 when using self-calc.
 ALIGN_RATIO = 0.915
+
+# Ammo tracking
+DEFAULT_TRACKER_PATH = os.path.expanduser("/home/mmogdeveloper/.openclaw/workspace/memory/dca_ammo_tracker.json")
+DEFAULT_TOTAL_UNITS = 600
 
 
 def fetch_btc_spot_coinbase():
@@ -86,6 +91,52 @@ def ahr999_primary_or_fallback():
     return ahr999_selfcalc()
 
 
+def load_tracker(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"total_units": DEFAULT_TOTAL_UNITS, "units_used": 0, "history": []}
+
+
+def save_tracker(path: str, tracker: dict):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(tracker, f, ensure_ascii=False, indent=2)
+
+
+def action_to_units(action: str) -> int:
+    # Returns how many baseline units consumed for the day
+    if action == "PAUSE":
+        return 0
+    if action == "1x":
+        return 1
+    if action == "2x":
+        return 2
+    if action == "3x":
+        return 3
+    return 0
+
+
+def update_tracker_for_today(tracker_path: str, action: str):
+    today = dt.datetime.utcnow().date().isoformat()
+    tracker = load_tracker(tracker_path)
+    tracker.setdefault("total_units", DEFAULT_TOTAL_UNITS)
+    tracker.setdefault("units_used", 0)
+    tracker.setdefault("history", [])
+
+    # avoid double counting the same day
+    for item in tracker["history"]:
+        if item.get("date") == today:
+            return tracker
+
+    units = action_to_units(action)
+    tracker["history"].append({"date": today, "action": action, "units": units})
+    tracker["units_used"] = int(tracker.get("units_used", 0)) + units
+    save_tracker(tracker_path, tracker)
+    return tracker
+
+
 def get_dca_instruction():
     # 1) Price
     try:
@@ -123,7 +174,14 @@ def get_dca_instruction():
     else:
         action = "1x"
 
-    # 6) Report
+    # 6) Ammo tracking (record today's recommended action as baseline consumption)
+    tracker_path = os.getenv("DCA_TRACKER_PATH", DEFAULT_TRACKER_PATH)
+    tracker = update_tracker_for_today(tracker_path, action)
+    total_units = int(tracker.get("total_units", DEFAULT_TOTAL_UNITS))
+    used_units = int(tracker.get("units_used", 0))
+    remaining_units = max(total_units - used_units, 0)
+
+    # 7) Report
     lines = []
     lines.append("=== QIUQIU DCA ADVISOR ===")
     lines.append(f"BTC Spot (Coinbase): ${price:,.2f}")
@@ -136,6 +194,8 @@ def get_dca_instruction():
     lines.append("--------------------------")
     lines.append(f"RECOMMENDED ACTION: [{action}]")
     lines.append("--------------------------")
+    lines.append(f"Ammo (baseline units): used {used_units}/{total_units}, remaining {remaining_units}")
+    lines.append(f"Tracker: {tracker_path}")
 
     return "\n".join(lines)
 
