@@ -23,7 +23,7 @@ DEFAULT_TRACKER_PATH = os.path.expanduser("/home/mmogdeveloper/.openclaw/workspa
 DEFAULT_TOTAL_UNITS = 600
 
 # Melt-down fuse: if we recommend 3x too long, downgrade to 2x to preserve ammo
-FUSE_3X_DAYS = int(os.getenv("DCA_FUSE_3X_DAYS", "45"))
+FUSE_3X_DAYS = int(os.getenv("DCA_FUSE_3X_DAYS", "60"))
 
 
 def fetch_btc_spot_coinbase():
