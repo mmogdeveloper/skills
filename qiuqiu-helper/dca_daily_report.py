@@ -24,6 +24,11 @@ DEFAULT_TOTAL_UNITS = 600
 
 # Melt-down fuse: if we recommend 3x too long, downgrade to 2x to preserve ammo
 FUSE_3X_DAYS = int(os.getenv("DCA_FUSE_3X_DAYS", "60"))
+# Soft fuse for prolonged 2x (degrade to 1x if not deeply undervalued)
+FUSE_2X_DAYS = int(os.getenv("DCA_FUSE_2X_DAYS", "180"))
+# Ammo guardrails
+AMMO_NO_3X_BELOW = int(os.getenv("DCA_AMMO_NO_3X_BELOW", "200"))
+AMMO_FORCE_1X_BELOW = int(os.getenv("DCA_AMMO_FORCE_1X_BELOW", "120"))
 
 
 def fetch_btc_spot_coinbase():
@@ -166,7 +171,6 @@ def consecutive_days(tracker: dict, action: str) -> int:
     hist = tracker.get("history", [])
     if not hist:
         return 0
-    # assume hist is appended in chronological order
     c = 0
     for item in reversed(hist):
         if item.get("action") == action:
@@ -174,6 +178,15 @@ def consecutive_days(tracker: dict, action: str) -> int:
         else:
             break
     return c
+
+
+def last_meta_value(tracker: dict, key: str):
+    # Find the most recent meta[key] in history
+    for item in reversed(tracker.get("history", [])):
+        meta = item.get("meta") or {}
+        if key in meta and meta[key] is not None:
+            return meta[key]
+    return None
 
 
 def get_dca_instruction():
@@ -221,22 +234,64 @@ def get_dca_instruction():
 
     # 6) MVRV confirmation rule (to prevent over-aggressive 3x)
     # Only allow 3x when MVRV Z-Score is "low" (cheap vs realized value).
-    # If MVRV is unavailable, we do NOT block 3x (best-effort), but we mark it.
-    if action == "3x" and mvrv.get("value") is not None:
-        if mvrv["value"] > 1.0:
+    # If MVRV is unavailable, we block 3x (downgrade to 2x) to stay conservative.
+    mvrv_note = None
+    if action == "3x":
+        if mvrv.get("value") is None:
             action = "2x"
+            mvrv_note = "MVRV unavailable → block 3x, downgrade to 2x"
+        elif mvrv["value"] > 1.0:
+            action = "2x"
+            mvrv_note = f"MVRV {mvrv['value']:.4f} > 1.0 → block 3x, downgrade to 2x"
 
     # 7) Ammo tracking (record today's recommended action as baseline consumption)
     tracker_path = os.getenv("DCA_TRACKER_PATH", DEFAULT_TRACKER_PATH)
 
-    # Apply fuse logic before recording
-    fuse_note = None
-    # Load tracker without mutating to decide fuse downgrade
+    # Load tracker without mutating to decide fuse/guardrails
     pre_tracker = load_tracker(tracker_path)
+
+    # Basic anomaly check on Ahr999 when using selfcalc: compare vs last known ahr
+    last_ahr = last_meta_value(pre_tracker, "ahr")
+    ahr_anomaly = None
+    if last_ahr is not None:
+        try:
+            last_ahr = float(last_ahr)
+            if last_ahr > 0 and abs(ahr_val - last_ahr) / last_ahr > 0.30:
+                ahr_anomaly = f"Ahr999 jump >30% vs last ({last_ahr:.4f} → {ahr_val:.4f}); data may be noisy"
+        except:
+            pass
+
+    # Apply guardrails + fuse logic before recording
+    fuse_note = None
+    mvrv_guard_note = mvrv_note
+
+    total_units_pre = int(pre_tracker.get("total_units", DEFAULT_TOTAL_UNITS))
+    used_units_pre = int(pre_tracker.get("units_used", 0))
+    remaining_pre = max(total_units_pre - used_units_pre, 0)
+
+    # Ammo guardrails
+    if remaining_pre < AMMO_FORCE_1X_BELOW and action != "PAUSE":
+        if action != "1x":
+            fuse_note = f"Ammo guardrail: remaining {remaining_pre} < {AMMO_FORCE_1X_BELOW} → force 1x"
+        action = "1x"
+
+    if remaining_pre < AMMO_NO_3X_BELOW and action == "3x":
+        action = "2x"
+        fuse_note = f"Ammo guardrail: remaining {remaining_pre} < {AMMO_NO_3X_BELOW} → block 3x, downgrade to 2x"
+
+    # 3x fuse (hard)
     streak_3x = consecutive_days(pre_tracker, "3x")
     if action == "3x" and streak_3x >= FUSE_3X_DAYS:
         action = "2x"
         fuse_note = f"Fuse tripped: 3x streak {streak_3x}d >= {FUSE_3X_DAYS}d → downgrade to 2x"
+
+    # 2x soft fuse: if 2x persists too long AND market isn't cheap enough, degrade to 1x
+    streak_2x = consecutive_days(pre_tracker, "2x")
+    if action == "2x" and streak_2x >= FUSE_2X_DAYS:
+        # require MVRV > 1.0 to trigger downgrade, otherwise keep 2x
+        if mvrv.get("value") is not None and mvrv["value"] > 1.0:
+            action = "1x"
+            fuse_note = f"Soft fuse: 2x streak {streak_2x}d >= {FUSE_2X_DAYS}d and MVRV {mvrv['value']:.4f} > 1.0 → downgrade to 1x"
 
     tracker = update_tracker_for_today(
         tracker_path,
@@ -244,8 +299,10 @@ def get_dca_instruction():
         meta={
             "mvrvZ": mvrv.get("value"),
             "mvrvDate": mvrv.get("date"),
+            "mvrvNote": mvrv_guard_note,
             "ahr": ahr_val,
             "ahrSource": ahr_source,
+            "ahrAnomaly": ahr_anomaly,
             "btc": price,
             "fuseNote": fuse_note,
         },
@@ -254,6 +311,7 @@ def get_dca_instruction():
     used_units = int(tracker.get("units_used", 0))
     remaining_units = max(total_units - used_units, 0)
     streak_3x_after = consecutive_days(tracker, "3x")
+    streak_2x_after = consecutive_days(tracker, "2x")
 
     # 8) Report
     lines = []
@@ -271,9 +329,15 @@ def get_dca_instruction():
     lines.append(f"RECOMMENDED ACTION:  [{action}]")
     lines.append("--------------------------")
     lines.append(f"Ammo (baseline units): used {used_units}/{total_units}, remaining {remaining_units}")
+    lines.append(f"2x streak:            {streak_2x_after} day(s)  (soft fuse={FUSE_2X_DAYS}d)")
     lines.append(f"3x streak:            {streak_3x_after} day(s)  (fuse={FUSE_3X_DAYS}d)")
+    lines.append(f"Ammo guardrails:      block3x<{AMMO_NO_3X_BELOW}, force1x<{AMMO_FORCE_1X_BELOW}")
+    if mvrv_guard_note:
+        lines.append(f"MVRV gate:            {mvrv_guard_note}")
     if fuse_note:
         lines.append(f"Fuse:                 {fuse_note}")
+    if ahr_anomaly:
+        lines.append(f"Data warning:         {ahr_anomaly}")
     lines.append(f"Tracker:              {tracker_path}")
 
     return "\n".join(lines)
