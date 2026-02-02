@@ -22,6 +22,9 @@ ALIGN_RATIO = 0.915
 DEFAULT_TRACKER_PATH = os.path.expanduser("/home/mmogdeveloper/.openclaw/workspace/memory/dca_ammo_tracker.json")
 DEFAULT_TOTAL_UNITS = 600
 
+# Melt-down fuse: if we recommend 3x too long, downgrade to 2x to preserve ammo
+FUSE_3X_DAYS = int(os.getenv("DCA_FUSE_3X_DAYS", "45"))
+
 
 def fetch_btc_spot_coinbase():
     r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=10)
@@ -135,7 +138,7 @@ def action_to_units(action: str) -> int:
     return 0
 
 
-def update_tracker_for_today(tracker_path: str, action: str):
+def update_tracker_for_today(tracker_path: str, action: str, meta: dict | None = None):
     today = dt.datetime.utcnow().date().isoformat()
     tracker = load_tracker(tracker_path)
     tracker.setdefault("total_units", DEFAULT_TOTAL_UNITS)
@@ -148,10 +151,29 @@ def update_tracker_for_today(tracker_path: str, action: str):
             return tracker
 
     units = action_to_units(action)
-    tracker["history"].append({"date": today, "action": action, "units": units})
+    entry = {"date": today, "action": action, "units": units}
+    if meta:
+        entry["meta"] = meta
+
+    tracker["history"].append(entry)
     tracker["units_used"] = int(tracker.get("units_used", 0)) + units
     save_tracker(tracker_path, tracker)
     return tracker
+
+
+def consecutive_days(tracker: dict, action: str) -> int:
+    # Count consecutive days ending at the most recent entry with the same action
+    hist = tracker.get("history", [])
+    if not hist:
+        return 0
+    # assume hist is appended in chronological order
+    c = 0
+    for item in reversed(hist):
+        if item.get("action") == action:
+            c += 1
+        else:
+            break
+    return c
 
 
 def get_dca_instruction():
@@ -206,10 +228,32 @@ def get_dca_instruction():
 
     # 7) Ammo tracking (record today's recommended action as baseline consumption)
     tracker_path = os.getenv("DCA_TRACKER_PATH", DEFAULT_TRACKER_PATH)
-    tracker = update_tracker_for_today(tracker_path, action)
+
+    # Apply fuse logic before recording
+    fuse_note = None
+    # Load tracker without mutating to decide fuse downgrade
+    pre_tracker = load_tracker(tracker_path)
+    streak_3x = consecutive_days(pre_tracker, "3x")
+    if action == "3x" and streak_3x >= FUSE_3X_DAYS:
+        action = "2x"
+        fuse_note = f"Fuse tripped: 3x streak {streak_3x}d >= {FUSE_3X_DAYS}d → downgrade to 2x"
+
+    tracker = update_tracker_for_today(
+        tracker_path,
+        action,
+        meta={
+            "mvrvZ": mvrv.get("value"),
+            "mvrvDate": mvrv.get("date"),
+            "ahr": ahr_val,
+            "ahrSource": ahr_source,
+            "btc": price,
+            "fuseNote": fuse_note,
+        },
+    )
     total_units = int(tracker.get("total_units", DEFAULT_TOTAL_UNITS))
     used_units = int(tracker.get("units_used", 0))
     remaining_units = max(total_units - used_units, 0)
+    streak_3x_after = consecutive_days(tracker, "3x")
 
     # 8) Report
     lines = []
@@ -227,7 +271,10 @@ def get_dca_instruction():
     lines.append(f"RECOMMENDED ACTION:  [{action}]")
     lines.append("--------------------------")
     lines.append(f"Ammo (baseline units): used {used_units}/{total_units}, remaining {remaining_units}")
-    lines.append(f"Tracker: {tracker_path}")
+    lines.append(f"3x streak:            {streak_3x_after} day(s)  (fuse={FUSE_3X_DAYS}d)")
+    if fuse_note:
+        lines.append(f"Fuse:                 {fuse_note}")
+    lines.append(f"Tracker:              {tracker_path}")
 
     return "\n".join(lines)
 
